@@ -5,6 +5,7 @@ import keyboard
 import sys
 import os
 import json
+import threading
 
 # --- Configuration Management ---
 CONFIG_FILE = os.path.expanduser("~/.minimal_clipboard_config.json")
@@ -80,6 +81,19 @@ class ClipboardApp:
         self.root.title("Minimalist Clipboard")
         self.root.geometry("800x600")
         self.root.configure(bg="#F5F5F7")
+
+        # --- 新增：加载自定义窗口图标 ---
+        # 支持在本地运行和 PyInstaller 打包后的路径读取
+        self.icon_path = "app_icon.ico"
+        if hasattr(sys, '_MEIPASS'):
+            self.icon_path = os.path.join(sys._MEIPASS, "app_icon.ico")
+
+        if os.path.exists(self.icon_path):
+            try:
+                self.root.iconbitmap(self.icon_path)
+            except Exception as e:
+                print(f"Failed to load window icon: {e}")
+        # -----------------------------
 
         # Apply the always-on-top setting (Fixes the screen switching issue)
         self.root.attributes("-topmost", self.config['always_on_top'])
@@ -159,6 +173,42 @@ class ClipboardApp:
         )
         self.text_area.insert("1.0", welcome_text)
         self.last_editor_text = self.text_area.get("1.0", "end-1c")
+
+        # 6. Initialize System Tray Icon (Windows bottom-right navigation bar)
+        self.setup_tray()
+
+    # --- System Tray Functionality ---
+    def setup_tray(self):
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+
+            def create_image():
+                # --- 修改：优先尝试加载生成的 app_icon.ico 作为托盘图标 ---
+                if os.path.exists(self.icon_path):
+                    try:
+                        return Image.open(self.icon_path)
+                    except Exception:
+                        pass
+
+                # 如果没有 ico 文件，则回退到动态绘制一个蓝底白字/简单方块
+                image = Image.new('RGB', (64, 64), color=(245, 245, 247))
+                d = ImageDraw.Draw(image)
+                d.rectangle((16, 16, 48, 48), fill="#0066CC")
+                return image
+
+            # System tray right-click menu
+            menu = pystray.Menu(
+                pystray.MenuItem('Show Window', lambda: self.root.after(0, self.show_window)),
+                pystray.MenuItem('Exit Application', lambda: self.root.after(0, self.quit_app))
+            )
+
+            self.tray_icon = pystray.Icon("MinimalClipboard", create_image(), "Minimal Clipboard", menu)
+
+            # Run tray icon in a separate thread so it doesn't block tkinter mainloop
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        except ImportError:
+            print("pystray or PIL not installed. Tray icon disabled. Please run: pip install pystray pillow")
 
     # --- Settings Functionality ---
     def change_shortcut(self):
@@ -247,6 +297,9 @@ class ClipboardApp:
         self.text_area.focus_set()
 
     def quit_app(self):
+        # Stop the tray icon before destroying the window
+        if hasattr(self, 'tray_icon'):
+            self.tray_icon.stop()
         self.root.destroy()
         sys.exit()
 
@@ -283,5 +336,20 @@ class ClipboardApp:
 
 
 if __name__ == "__main__":
+    # Prevent multiple instances running simultaneously (Windows)
+    if os.name == 'nt':
+        import ctypes
+
+        mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "MinimalClipboardEditor_Mutex")
+        if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            tmp_root = tk.Tk()
+            tmp_root.withdraw()
+            messagebox.showwarning(
+                "Already Running",
+                "Minimalist Clipboard Editor is already running in the background!\n\n"
+                "Please press your shortcut (default Alt+X) or check the system tray in the bottom right."
+            )
+            sys.exit(0)
+
     app = ClipboardApp()
     app.root.mainloop()
