@@ -16,9 +16,35 @@ DEFAULT_CONFIG = {
     "hotkey": "alt+x",
     "autostart": True,
     "always_on_top": True,
+    "incremental_mode": False,
 }
 SYNC_INTERVAL_MS = 300
 HIGHLIGHT_DEBOUNCE_MS = 250
+LARGE_DOC_CHAR_THRESHOLD = 120_000
+LARGE_DOC_LINE_THRESHOLD = 3_000
+
+MD_TAGS = (
+    "md_h1",
+    "md_h2",
+    "md_h3",
+    "md_h4",
+    "md_bold",
+    "md_italic",
+    "md_code",
+    "md_codeblock",
+    "md_link",
+    "md_list",
+    "md_blockquote",
+    "md_hr",
+)
+
+RE_HEADING = re.compile(r"^(#{1,6})\s")
+RE_HR = re.compile(r"^(\*{3,}|-{3,}|_{3,})\s*$")
+RE_LIST_ITEM = re.compile(r"^(\s*(?:[\-\*\+]|\d+\.))\s")
+RE_BOLD = re.compile(r"(\*\*|__)(.+?)\1")
+RE_ITALIC = re.compile(r"(?<!\*)(\*|_)(?!\*)(.+?)(?<!\*)\1(?!\*)")
+RE_CODE = re.compile(r"`([^`]+)`")
+RE_LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 
 def load_config():
@@ -92,7 +118,8 @@ class ClipboardApp:
         self.root.attributes("-topmost", self.config["always_on_top"])
 
         self.font_size = self.config["font_size"]
-        self.font_family = "Segoe UI"
+        self.font_family = "Microsoft YaHei"
+        self.incremental_mode = self.config["incremental_mode"]
 
         self.current_file_path = None
         self.last_clipboard_text = ""
@@ -100,6 +127,9 @@ class ClipboardApp:
         self.editor_dirty = False
         self._programmatic_update = False
         self._highlight_after_id = None
+        self._highlight_force_pending = False
+        self._last_highlight_text = None
+        self._last_highlight_light_mode = None
 
         self._build_menu()
         self._build_editor()
@@ -108,6 +138,7 @@ class ClipboardApp:
         welcome_text = (
             "Welcome to the Minimalist Clipboard!\n\n"
             "Clipboard sync is always enabled.\n"
+            "Incremental paste mode can append new clipboard content.\n"
             "Read In File loads .md/.txt content directly into the editor.\n"
             "Markdown highlight is unified for all content.\n"
         )
@@ -131,9 +162,15 @@ class ClipboardApp:
         self.settings_menu = tk.Menu(self.menubar, tearoff=0)
         self.autostart_var = tk.BooleanVar(value=self.config["autostart"])
         self.topmost_var = tk.BooleanVar(value=self.config["always_on_top"])
+        self.incremental_mode_var = tk.BooleanVar(value=self.incremental_mode)
         self.settings_menu.add_command(label="Change Shortcut...", command=self.change_shortcut)
         self.settings_menu.add_command(label="Change Font Size...", command=self.change_font_size)
         self.settings_menu.add_separator()
+        self.settings_menu.add_checkbutton(
+            label="Incremental Paste Mode   Ctrl+Shift+I",
+            variable=self.incremental_mode_var,
+            command=self.toggle_incremental_mode,
+        )
         self.settings_menu.add_checkbutton(
             label="Always on Top",
             variable=self.topmost_var,
@@ -200,6 +237,7 @@ class ClipboardApp:
         self.root.bind("<Control-s>", lambda e: self.save_file())
         self.root.bind("<Control-Shift-S>", lambda e: self.save_file_as())
         self.root.bind("<Control-n>", lambda e: self.new_file())
+        self.root.bind("<Control-Shift-I>", self.toggle_incremental_mode_shortcut)
 
     # --- Tray ---
     def setup_tray(self):
@@ -224,7 +262,7 @@ class ClipboardApp:
             )
             self.tray_icon = pystray.Icon("MinimalClipboard", create_image(), "Minimal Clipboard", menu)
             threading.Thread(target=self.tray_icon.run, daemon=True).start()
-        except ImportError:
+        except Exception:
             print("pystray or PIL not installed. Tray icon disabled.")
 
     # --- Settings ---
@@ -265,7 +303,17 @@ class ClipboardApp:
         self.config["font_size"] = self.font_size
         save_config(self.config)
         self._setup_markdown_tags()
-        self._schedule_highlight()
+        self._schedule_highlight(force=True)
+
+    def toggle_incremental_mode(self):
+        self.incremental_mode = self.incremental_mode_var.get()
+        self.config["incremental_mode"] = self.incremental_mode
+        save_config(self.config)
+
+    def toggle_incremental_mode_shortcut(self, _event=None):
+        self.incremental_mode_var.set(not self.incremental_mode_var.get())
+        self.toggle_incremental_mode()
+        return "break"
 
     def toggle_topmost(self):
         is_topmost = self.topmost_var.get()
@@ -295,7 +343,7 @@ class ClipboardApp:
         self.config["font_size"] = self.font_size
         save_config(self.config)
         self._setup_markdown_tags()
-        self._schedule_highlight()
+        self._schedule_highlight(force=True)
         return "break"
 
     # --- Unified content flow ---
@@ -305,6 +353,18 @@ class ClipboardApp:
             return True
         except Exception:
             return False
+
+    def _get_clipboard_text(self):
+        try:
+            return pyperclip.paste()
+        except Exception:
+            return self.last_clipboard_text
+
+    def _sync_clipboard_from_editor(self, text):
+        if self._safe_copy_to_clipboard(text):
+            self.last_clipboard_text = text
+            return True
+        return False
 
     def _replace_editor_content(self, content, keep_cursor=True):
         cursor_pos = self.text_area.index(tk.INSERT) if keep_cursor else "1.0"
@@ -319,6 +379,29 @@ class ClipboardApp:
         self._programmatic_update = False
 
         self.last_editor_text = content
+        self.editor_dirty = False
+        self._schedule_highlight()
+
+    def _append_editor_content(self, content):
+        if content == "":
+            return
+
+        existing = self.text_area.get("1.0", "end-1c")
+        if not existing:
+            merged = content
+            chunk_to_insert = content
+        else:
+            separator = "" if existing.endswith("\n") or content.startswith("\n") else "\n"
+            merged = f"{existing}{separator}{content}"
+            chunk_to_insert = f"{separator}{content}"
+
+        self._programmatic_update = True
+        self.text_area.insert("end-1c", chunk_to_insert)
+        self.text_area.mark_set(tk.INSERT, tk.END)
+        self.text_area.edit_modified(False)
+        self._programmatic_update = False
+
+        self.last_editor_text = merged
         self.editor_dirty = False
         self._schedule_highlight()
 
@@ -342,8 +425,7 @@ class ClipboardApp:
     def new_file(self):
         self.current_file_path = None
         self._replace_editor_content("", keep_cursor=False)
-        self.last_clipboard_text = ""
-        self._safe_copy_to_clipboard("")
+        self._sync_clipboard_from_editor("")
         self._update_title()
 
     def _read_text_file_with_fallback(self, file_path):
@@ -376,8 +458,7 @@ class ClipboardApp:
 
         self.current_file_path = file_path
         self._replace_editor_content(content, keep_cursor=False)
-        self.last_clipboard_text = content
-        self._safe_copy_to_clipboard(content)
+        self._sync_clipboard_from_editor(content)
         self._update_title()
 
     def save_file(self):
@@ -452,41 +533,44 @@ class ClipboardApp:
         self.text_area.tag_configure("md_hr", foreground="#ADB5BD")
 
     def _clear_markdown_tags(self):
-        for tag in [
-            "md_h1",
-            "md_h2",
-            "md_h3",
-            "md_h4",
-            "md_bold",
-            "md_italic",
-            "md_code",
-            "md_codeblock",
-            "md_link",
-            "md_list",
-            "md_blockquote",
-            "md_hr",
-        ]:
+        for tag in MD_TAGS:
             self.text_area.tag_remove(tag, "1.0", tk.END)
 
-    def _schedule_highlight(self):
+    def _schedule_highlight(self, force=False):
+        if force:
+            self._highlight_force_pending = True
         if self._highlight_after_id:
             self.root.after_cancel(self._highlight_after_id)
         self._highlight_after_id = self.root.after(HIGHLIGHT_DEBOUNCE_MS, self._apply_markdown_highlight)
 
+    def _use_light_highlight(self, content, line_count):
+        return len(content) >= LARGE_DOC_CHAR_THRESHOLD or line_count >= LARGE_DOC_LINE_THRESHOLD
+
     def _apply_markdown_highlight(self):
+        force = self._highlight_force_pending
+        self._highlight_force_pending = False
         self._highlight_after_id = None
+        content = self.text_area.get("1.0", "end-1c")
+        lines = content.split("\n")
+        light_mode = self._use_light_highlight(content, len(lines))
+
+        if (
+            not force
+            and content == self._last_highlight_text
+            and light_mode == self._last_highlight_light_mode
+        ):
+            return
+
         self._clear_markdown_tags()
 
-        content = self.text_area.get("1.0", tk.END)
-        lines = content.split("\n")
         in_code_block = False
 
-        for i, line in enumerate(lines):
-            line_num = i + 1
-            line_start = f"{line_num}.0"
-            line_end = f"{line_num}.end"
+        for i, line in enumerate(lines, start=1):
+            line_start = f"{i}.0"
+            line_end = f"{i}.end"
+            stripped = line.strip()
 
-            if line.strip().startswith("```"):
+            if stripped.startswith("```"):
                 self.text_area.tag_add("md_codeblock", line_start, line_end)
                 in_code_block = not in_code_block
                 continue
@@ -495,36 +579,42 @@ class ClipboardApp:
                 self.text_area.tag_add("md_codeblock", line_start, line_end)
                 continue
 
-            h_match = re.match(r"^(#{1,6})\s", line)
+            h_match = RE_HEADING.match(line)
             if h_match:
                 level = len(h_match.group(1))
                 self.text_area.tag_add(f"md_h{min(level, 4)}", line_start, line_end)
                 continue
 
-            if re.match(r"^(\*{3,}|-{3,}|_{3,})\s*$", line.strip()):
+            if RE_HR.match(stripped):
                 self.text_area.tag_add("md_hr", line_start, line_end)
                 continue
 
-            if line.strip().startswith(">"):
+            if stripped.startswith(">"):
                 self.text_area.tag_add("md_blockquote", line_start, line_end)
                 continue
 
-            if re.match(r"^\s*([\-\*\+]|\d+\.)\s", line):
-                bullet_match = re.match(r"^(\s*[\-\*\+]|\s*\d+\.)", line)
-                if bullet_match:
-                    self.text_area.tag_add("md_list", line_start, f"{line_num}.{bullet_match.end()}")
+            list_match = RE_LIST_ITEM.match(line)
+            if list_match:
+                self.text_area.tag_add("md_list", line_start, f"{i}.{list_match.end(1)}")
 
-            for m in re.finditer(r"(\*\*|__)(.+?)\1", line):
-                self.text_area.tag_add("md_bold", f"{line_num}.{m.start()}", f"{line_num}.{m.end()}")
+            # Large documents use lightweight block-level highlighting only.
+            if light_mode:
+                continue
 
-            for m in re.finditer(r"(?<!\*)(\*|_)(?!\*)(.+?)(?<!\*)\1(?!\*)", line):
-                self.text_area.tag_add("md_italic", f"{line_num}.{m.start()}", f"{line_num}.{m.end()}")
+            for m in RE_BOLD.finditer(line):
+                self.text_area.tag_add("md_bold", f"{i}.{m.start()}", f"{i}.{m.end()}")
 
-            for m in re.finditer(r"`([^`]+)`", line):
-                self.text_area.tag_add("md_code", f"{line_num}.{m.start()}", f"{line_num}.{m.end()}")
+            for m in RE_ITALIC.finditer(line):
+                self.text_area.tag_add("md_italic", f"{i}.{m.start()}", f"{i}.{m.end()}")
 
-            for m in re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", line):
-                self.text_area.tag_add("md_link", f"{line_num}.{m.start()}", f"{line_num}.{m.end()}")
+            for m in RE_CODE.finditer(line):
+                self.text_area.tag_add("md_code", f"{i}.{m.start()}", f"{i}.{m.end()}")
+
+            for m in RE_LINK.finditer(line):
+                self.text_area.tag_add("md_link", f"{i}.{m.start()}", f"{i}.{m.end()}")
+
+        self._last_highlight_text = content
+        self._last_highlight_light_mode = light_mode
 
     # --- Window control ---
     def show_context_menu(self, event):
@@ -555,23 +645,24 @@ class ClipboardApp:
 
     # --- Clipboard sync ---
     def sync_clipboard(self):
-        try:
-            current_clipboard = pyperclip.paste()
-        except Exception:
-            current_clipboard = self.last_clipboard_text
+        current_clipboard = self._get_clipboard_text()
 
         if current_clipboard != self.last_clipboard_text:
-            self._replace_editor_content(current_clipboard, keep_cursor=True)
+            if self.incremental_mode:
+                self._append_editor_content(current_clipboard)
+            else:
+                self._replace_editor_content(current_clipboard, keep_cursor=True)
             self.last_clipboard_text = current_clipboard
             self.current_file_path = None
             self._update_title()
         elif self.editor_dirty:
             current_editor = self.text_area.get("1.0", "end-1c")
             if current_editor != self.last_editor_text:
-                self._safe_copy_to_clipboard(current_editor)
-                self.last_clipboard_text = current_editor
+                copied = self._sync_clipboard_from_editor(current_editor)
                 self.last_editor_text = current_editor
-            self.editor_dirty = False
+                self.editor_dirty = not copied
+            else:
+                self.editor_dirty = False
 
         self.root.after(SYNC_INTERVAL_MS, self.sync_clipboard)
 
